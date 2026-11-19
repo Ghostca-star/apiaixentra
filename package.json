@@ -1,9 +1,11 @@
+// package.json
 {
-  "name": "deepseek-proxy-api",
+  "name": "vercel-deepseek-proxy",
   "version": "1.0.0",
-  "type": "module",
   "private": true,
+  "type": "module",
+  "engines": { "node": ">=20.0.0" },
   "dependencies": {
-    "undici": "^7.0.0"
+    "undici": "^6.19.8"
   }
 }
