@@ -1,12 +1,15 @@
 // api/index.js
 // Proxy API ke upstream DeepSeek. Open public, tanpa auth.
 // ESM, Node 18+, single handler, semua route di sini.
+// Paksa HTTP/1.1 via undici allowH2:false (Vercel blokir env VERCEL_FETCH_DISABLE_H2).
 
 import { PROMPT_TERTANAM } from "../prompt.js";
+import { fetch as undiciFetch, Agent } from "undici";
 
-// WAJIB pakai trailing slash "/deepsek/" — tanpa slash upstream balikin 301
-// dan fetch di Vercel gagal (ECONNRESET).
 const UPSTREAM_URL = "https://api.nexadev.my.id/ai/deepsek/";
+
+// Agent dengan allowH2:false → paksa HTTP/1.1, hindari frameError HTTP/2
+const http1Agent = new Agent({ allowH2: false });
 
 function json(res, status, body) {
   res.statusCode = status;
@@ -48,9 +51,9 @@ function extractQuestion(req, body, url) {
 
 async function callUpstream(teksLengkap) {
   const target = UPSTREAM_URL + "?text=" + encodeURIComponent(teksLengkap);
-  const r = await fetch(target, {
+  const r = await undiciFetch(target, {
     method: "GET",
-    redirect: "follow",
+    dispatcher: http1Agent,
     headers: {
       Accept: "application/json",
       "User-Agent": "Mozilla/5.0 (compatible; VercelProxy/1.0)",
@@ -75,7 +78,6 @@ export default async function handler(req, res) {
   const url = new URL(req.url, "http://localhost");
   const path = url.pathname;
 
-  // health hanya di root dan /health
   if (path === "/" || path === "/health") {
     return json(res, 200, {
       ok: true,
