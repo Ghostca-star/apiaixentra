@@ -1,17 +1,11 @@
 // api/index.js
 //
-// Proxy Vercel: /ask, /api/ask, /api  →  upstream deepseek.
-// Prompt panjang + pertanyaan user dikirim lewat body POST JSON.
+// Proxy Vercel minimal: /ask, /api/ask, /api → upstream deepseek.
+// Tidak ada PROMPT_TERTANAM. Pertanyaan user diteruskan apa adanya.
+// POST JSON dengan UA browser (curl UA diblok upstream sejak 2026-11-19).
 //
-// Fakta upstream (diukur 2026-11-19):
-//   POST tanpa body                         → 403
-//   POST body JSON + UA curl                → 403
-//   POST body JSON + UA browser             → 200, JSON {status:true, result:...}
-//   GET ?text=halo                          → 403
-// Maka: selalu kirim POST dengan UA browser, body JSON. Fallback form
-// sebagai cadangan kalau WAF upstream mulai inspeksi body JSON.
+// Kalau request ini masih 403 dari Vercel, itu IP block — bukan kode.
 
-import { PROMPT_TERTANAM } from "../prompt.js";
 import { fetch as undiciFetch, Agent } from "undici";
 
 const UPSTREAM_BASE = "https://api.nexadev.my.id/ai/deepsek/";
@@ -81,13 +75,8 @@ function pickAnswer(data) {
   return "";
 }
 
-async function readResponseSafely(r) {
-  const raw = await r.text();
-  try { return { parsed: JSON.parse(raw), raw }; } catch { return { parsed: null, raw }; }
-}
-
-async function callUpstreamJson(payload) {
-  const body = JSON.stringify(payload);
+async function callUpstreamJson(text) {
+  const body = JSON.stringify({ text, prompt: text, question: text });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -103,16 +92,20 @@ async function callUpstreamJson(payload) {
       dispatcher: http1Agent,
       signal: controller.signal,
     });
-    const { parsed, raw } = await readResponseSafely(r);
+    const raw = await r.text();
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch {}
     return { httpStatus: r.status, ok: r.ok, parsed, raw };
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function callUpstreamForm(payload) {
+async function callUpstreamForm(text) {
   const form = new URLSearchParams();
-  for (const [k, v] of Object.entries(payload)) form.append(k, String(v));
+  form.append("text", text);
+  form.append("prompt", text);
+  form.append("question", text);
   const body = form.toString();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -129,19 +122,19 @@ async function callUpstreamForm(payload) {
       dispatcher: http1Agent,
       signal: controller.signal,
     });
-    const { parsed, raw } = await readResponseSafely(r);
+    const raw = await r.text();
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch {}
     return { httpStatus: r.status, ok: r.ok, parsed, raw };
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function callUpstream(teksLengkap) {
-  // Payload selalu punya isi. POST tanpa body = 403 di upstream.
-  const payload = { text: teksLengkap, prompt: teksLengkap, question: teksLengkap };
+async function callUpstream(text) {
   const attempts = [
-    { name: "POST JSON + UA browser",        fn: () => callUpstreamJson(payload) },
-    { name: "POST URL-encoded + UA browser", fn: () => callUpstreamForm(payload) },
+    { name: "POST JSON + UA browser",        fn: () => callUpstreamJson(text) },
+    { name: "POST URL-encoded + UA browser", fn: () => callUpstreamForm(text) },
   ];
   let last = null;
   for (const a of attempts) {
@@ -174,7 +167,7 @@ export default async function handler(req, res) {
       ok: true,
       service: "deepseek-proxy-api",
       upstream: UPSTREAM_BASE,
-      prompt_chars: PROMPT_TERTANAM.length,
+      prompt_mode: "none",
       time: new Date().toISOString(),
     });
   }
@@ -193,18 +186,15 @@ export default async function handler(req, res) {
   if (!question) return json(res, 400, { ok: false, error: "Pertanyaan kosong" });
   if (question.length > MAX_QUESTION_CHARS) return json(res, 400, { ok: false, error: `Pertanyaan maks ${MAX_QUESTION_CHARS} karakter` });
 
-  const teksLengkap = PROMPT_TERTANAM + "\nPertanyaan user: " + question;
-
   try {
-    const upstream = await callUpstream(teksLengkap);
+    const upstream = await callUpstream(question);
 
     if (!upstream.ok) {
       return json(res, 502, {
         ok: false,
         error: "Upstream gagal di semua varian POST",
         last_attempt: upstream.last,
-        prompt_chars: PROMPT_TERTANAM.length,
-        full_payload_chars: teksLengkap.length,
+        payload_chars: question.length,
       });
     }
 
@@ -223,8 +213,7 @@ export default async function handler(req, res) {
       ok: true,
       question,
       answer,
-      prompt_chars: PROMPT_TERTANAM.length,
-      full_payload_chars: teksLengkap.length,
+      payload_chars: question.length,
       attempt: upstream.attempt,
       upstream_url: UPSTREAM_BASE,
       time: new Date().toISOString(),
