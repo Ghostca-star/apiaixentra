@@ -2,5 +2,8 @@
   "name": "deepseek-proxy-api",
   "version": "1.0.0",
   "type": "module",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "undici": "^7.0.0"
+  }
 }
