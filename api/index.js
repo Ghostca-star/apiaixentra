@@ -4,7 +4,9 @@
 
 import { PROMPT_TERTANAM } from "../prompt.js";
 
-const UPSTREAM_URL = "https://api.nexadev.my.id/ai/deepsek";
+// WAJIB pakai trailing slash "/deepsek/" — tanpa slash upstream balikin 301
+// dan fetch di Vercel gagal (ECONNRESET).
+const UPSTREAM_URL = "https://api.nexadev.my.id/ai/deepsek/";
 
 function json(res, status, body) {
   res.statusCode = status;
@@ -48,7 +50,11 @@ async function callUpstream(teksLengkap) {
   const target = UPSTREAM_URL + "?text=" + encodeURIComponent(teksLengkap);
   const r = await fetch(target, {
     method: "GET",
-    headers: { Accept: "application/json" },
+    redirect: "follow",
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible; VercelProxy/1.0)",
+    },
   });
   const rawText = await r.text();
   let parsed = null;
@@ -69,10 +75,8 @@ export default async function handler(req, res) {
   const url = new URL(req.url, "http://localhost");
   const path = url.pathname;
 
-  if (path === "/" || path === "/health" || path === "/api" || path === "/api/health") {
-    if (req.method !== "GET" && req.method !== "POST") {
-      return json(res, 405, { ok: false, error: "Method not allowed" });
-    }
+  // health hanya di root dan /health
+  if (path === "/" || path === "/health") {
     return json(res, 200, {
       ok: true,
       service: "deepseek-proxy-api",
@@ -85,7 +89,7 @@ export default async function handler(req, res) {
     });
   }
 
-  const isAsk = path === "/ask" || path === "/api/ask" || path === "/";
+  const isAsk = path === "/ask" || path === "/api/ask" || path === "/api";
   if (!isAsk) {
     return json(res, 404, {
       ok: false,
@@ -153,10 +157,21 @@ export default async function handler(req, res) {
       time: new Date().toISOString(),
     });
   } catch (e) {
+    const cause =
+      e && e.cause
+        ? {
+            code: e.cause.code || null,
+            errno: e.cause.errno || null,
+            syscall: e.cause.syscall || null,
+            hostname: e.cause.hostname || null,
+            message: e.cause.message || String(e.cause),
+          }
+        : null;
     return json(res, 500, {
       ok: false,
       error: "Gagal memanggil upstream",
       detail: String(e && e.message ? e.message : e),
+      cause,
     });
   }
 }
