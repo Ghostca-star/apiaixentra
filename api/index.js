@@ -5,8 +5,6 @@ import { PROMPT_TERTANAM } from "../prompt.js";
 import { fetch as undiciFetch, Agent } from "undici";
 
 const UPSTREAM_BASE = "https://api.nexadev.my.id/ai/deepsek/";
-
-// Agent dengan allowH2:false → paksa HTTP/1.1
 const http1Agent = new Agent({ allowH2: false });
 
 function json(res, status, body) {
@@ -43,29 +41,36 @@ function extractQuestion(req, body, url) {
 }
 
 async function callUpstream(teksLengkap) {
-  // 1. Coba POST dulu (biar tidak kena limit URL)
+  // 1. Coba POST form-urlencoded (upstream minta parameter "text")
   try {
+    const form = new URLSearchParams();
+    form.append("text", teksLengkap);
+
     const rPost = await undiciFetch(UPSTREAM_BASE, {
       method: "POST",
       dispatcher: http1Agent,
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ text: teksLengkap, prompt: teksLengkap, question: teksLengkap })
+      headers: { 
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json" 
+      },
+      body: form.toString()
     });
     
-    if (rPost.ok) {
-      const raw = await rPost.text();
-      let parsed = null; try { parsed = JSON.parse(raw); } catch {}
+    const raw = await rPost.text();
+    let parsed = null; try { parsed = JSON.parse(raw); } catch {}
+    
+    // Kalau responnya valid JSON dan status true, langsung balikin
+    if (rPost.ok && parsed && parsed.status) {
       return { ok: true, status: rPost.status, parsed, rawText: raw };
     }
-    // Kalau POST ditolak (404/405), lanjut ke GET
   } catch (e) {
-    // Abaikan error POST, coba GET
+    // Abaikan error POST, lanjut ke GET
   }
 
-  // 2. Fallback ke GET (tapi kita potong prompt-nya kalau kepanjangan)
-  // Vercel punya limit URL, upstream juga. Kita batasi total URL max ~4000 char.
-  const safeTeks = teksLengkap.length > 3000 ? teksLengkap.slice(-3000) : teksLengkap;
-  const target = UPSTREAM_BASE + "?text=" + encodeURIComponent(safeTeks);
+  // 2. Fallback ke GET (pakai URLSearchParams biar encoding lebih rapi)
+  const params = new URLSearchParams();
+  params.append("text", teksLengkap);
+  const target = UPSTREAM_BASE + "?" + params.toString();
   
   const r = await undiciFetch(target, {
     method: "GET",
@@ -110,7 +115,6 @@ export default async function handler(req, res) {
   const question = extractQuestion(req, body, url);
   if (!question) return json(res, 400, { ok: false, error: "Pertanyaan kosong" });
 
-  // Gabung prompt + pertanyaan
   const teksLengkap = PROMPT_TERTANAM + "\nPertanyaan user: " + question;
 
   try {
