@@ -1,11 +1,14 @@
 // api/index.js
 //
-// Proxy Vercel tanpa prompt. Upstream PHP NexaDev cuma baca $_GET[text] —
-// POST body diabaikan meski Content-Type JSON atau form. Maka proxy
-// menerjemahkan /ask POST dari client jadi GET ?text=... ke upstream.
+// Proxy Vercel tanpa prompt. Upstream PHP NexaDev cuma baca $_GET[text];
+// POST body diabaikan. Maka proxy menerjemahkan /ask POST jadi GET ?text=...
 //
-// Batas URL upstream ~8KB; question dibatasi 4000 char (aman setelah
-// percent-encoding). Prompt panjang tidak lewat jalur ini.
+// Perbaikan dari versi sebelumnya:
+//   - readBody kasih timeout 2000ms. Kalau stream gak pernah end (Vercel
+//     sudah drain di layer atas), resolve {} supaya handler tetap lanjut
+//     dan extractQuestion bisa fallback ke query string.
+//   - Kalau req.body sudah object dari Vercel, langsung pakai tanpa sentuh
+//     stream.
 
 import { fetch as undiciFetch, Agent } from "undici";
 
@@ -14,6 +17,7 @@ const http1Agent = new Agent({ allowH2: false, connectTimeout: 10000, headersTim
 const BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const MAX_BODY_BYTES = 256 * 1024;
+const BODY_READ_TIMEOUT_MS = 2000;
 const MAX_QUESTION_CHARS = 4000;
 const REQUEST_TIMEOUT_MS = 28000;
 
@@ -30,28 +34,52 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+function parseJsonOrRaw(text) {
+  if (!text) return {};
+  try { return JSON.parse(text); } catch { return { raw: text }; }
+}
+
 async function readBody(req) {
-  if (req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body)) return req.body;
+  // Vercel kadang sudah parse body jadi object sebelum handler dipanggil.
+  if (req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body)) {
+    return req.body;
+  }
   if (Buffer.isBuffer(req.body)) {
-    try { return JSON.parse(req.body.toString("utf8")); } catch { return { raw: req.body.toString("utf8") }; }
+    return parseJsonOrRaw(req.body.toString("utf8"));
   }
   if (typeof req.body === "string" && req.body.length) {
-    try { return JSON.parse(req.body); } catch { return { raw: req.body }; }
+    return parseJsonOrRaw(req.body);
   }
+
   return await new Promise((resolve) => {
     let size = 0;
+    let done = false;
     const chunks = [];
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      // Stream tidak pernah end. Lepas listener dan beri objek kosong;
+      // extractQuestion akan jatuh ke query string kalau ada.
+      req.removeAllListeners("data");
+      req.removeAllListeners("end");
+      req.removeAllListeners("error");
+      finish({});
+    }, BODY_READ_TIMEOUT_MS);
+
     req.on("data", (c) => {
       size += c.length;
-      if (size > MAX_BODY_BYTES) { req.destroy(); return resolve({ __overflow: true }); }
+      if (size > MAX_BODY_BYTES) {
+        finish({ __overflow: true });
+        return;
+      }
       chunks.push(c);
     });
-    req.on("end", () => {
-      const data = Buffer.concat(chunks).toString("utf8");
-      if (!data) return resolve({});
-      try { resolve(JSON.parse(data)); } catch { resolve({ raw: data }); }
-    });
-    req.on("error", () => resolve({}));
+    req.on("end", () => finish(parseJsonOrRaw(Buffer.concat(chunks).toString("utf8"))));
+    req.on("error", () => finish({}));
   });
 }
 
@@ -115,13 +143,25 @@ export default async function handler(req, res) {
 
   let body = {};
   if (req.method === "POST") {
-    body = await readBody(req);
+    try {
+      body = await readBody(req);
+    } catch (e) {
+      return json(res, 400, { ok: false, error: "Gagal baca body", detail: String(e?.message ?? e) });
+    }
     if (body && body.__overflow) return json(res, 413, { ok: false, error: "Body terlalu besar" });
   }
 
   const question = extractQuestion(body, url);
-  if (!question) return json(res, 400, { ok: false, error: "Pertanyaan kosong" });
-  if (question.length > MAX_QUESTION_CHARS) return json(res, 400, { ok: false, error: `Pertanyaan maks ${MAX_QUESTION_CHARS} karakter (upstream baca GET query, batas URL)` });
+  if (!question) {
+    return json(res, 400, {
+      ok: false,
+      error: "Pertanyaan kosong",
+      debug: { method: req.method, body_keys: body && typeof body === "object" ? Object.keys(body) : null, has_query: url.search.length > 0 },
+    });
+  }
+  if (question.length > MAX_QUESTION_CHARS) {
+    return json(res, 400, { ok: false, error: `Pertanyaan maks ${MAX_QUESTION_CHARS} karakter` });
+  }
 
   try {
     const upstream = await callUpstreamGet(question);
