@@ -1,18 +1,15 @@
 // api/index.js
 //
 // Proxy Vercel: /ask, /api/ask, /api  →  upstream deepseek.
-// Tempel prompt panjang + pertanyaan user, forward ke upstream.
+// Prompt panjang + pertanyaan user dikirim lewat body POST JSON.
 //
-// Perbaikan dari versi paste:
-//   - PROMPT_TERTANAM berpotensi > 8KB → tidak pernah dipakai sebagai URL.
-//     Fallback GET cuma bawa pertanyaan user (bukan prompt), di-slice di
-//     karakter boundary aman (bukan byte), dan upstream dipanggil dengan
-//     header X-Prompt-Mode: question-only supaya server tahu prompt tidak
-//     ikut di URL.
-//   - Body parsing Vercel: req.body bisa sudah object (Vercel parse) atau
-//     stream mentah. Stream dibaca dengan limit 256KB supaya tidak OOM.
-//   - Error upstream diteruskan dengan upstream_status (numeric) dan
-//     upstream_body (string kalau bukan JSON), bukan cuma raw text.
+// Fakta upstream (diukur 2026-11-19):
+//   POST tanpa body                         → 403
+//   POST body JSON + UA curl                → 403
+//   POST body JSON + UA browser             → 200, JSON {status:true, result:...}
+//   GET ?text=halo                          → 403
+// Maka: selalu kirim POST dengan UA browser, body JSON. Fallback form
+// sebagai cadangan kalau WAF upstream mulai inspeksi body JSON.
 
 import { PROMPT_TERTANAM } from "../prompt.js";
 import { fetch as undiciFetch, Agent } from "undici";
@@ -20,8 +17,10 @@ import { fetch as undiciFetch, Agent } from "undici";
 const UPSTREAM_BASE = "https://api.nexadev.my.id/ai/deepsek/";
 const http1Agent = new Agent({ allowH2: false, connectTimeout: 10000, headersTimeout: 25000, bodyTimeout: 25000 });
 
+const BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
 const MAX_BODY_BYTES = 256 * 1024;
-const MAX_QUESTION_CHARS = 1200;      // GET fallback: hanya user question, bukan prompt
+const MAX_QUESTION_CHARS = 4000;
 const REQUEST_TIMEOUT_MS = 28000;
 
 function corsHeaders(res) {
@@ -50,10 +49,7 @@ async function readBody(req) {
     const chunks = [];
     req.on("data", (c) => {
       size += c.length;
-      if (size > MAX_BODY_BYTES) {
-        req.destroy();
-        return resolve({ __overflow: true });
-      }
+      if (size > MAX_BODY_BYTES) { req.destroy(); return resolve({ __overflow: true }); }
       chunks.push(c);
     });
     req.on("end", () => {
@@ -86,16 +82,12 @@ function pickAnswer(data) {
 }
 
 async function readResponseSafely(r) {
-  const ct = r.headers.get("content-type") || "";
   const raw = await r.text();
-  if (ct.includes("application/json")) {
-    try { return { parsed: JSON.parse(raw), raw }; } catch { return { parsed: null, raw }; }
-  }
   try { return { parsed: JSON.parse(raw), raw }; } catch { return { parsed: null, raw }; }
 }
 
-async function callUpstreamJson(teksLengkap) {
-  const payload = JSON.stringify({ text: teksLengkap, prompt: teksLengkap, question: teksLengkap });
+async function callUpstreamJson(payload) {
+  const body = JSON.stringify(payload);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -104,33 +96,7 @@ async function callUpstreamJson(teksLengkap) {
       headers: {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "Content-Length": String(Buffer.byteLength(payload, "utf8")),
-      },
-      body: payload,
-      dispatcher: http1Agent,
-      signal: controller.signal,
-    });
-    const { parsed, raw } = await readResponseSafely(r);
-    return { httpStatus: r.status, ok: r.ok, parsed, raw };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function callUpstreamForm(teksLengkap) {
-  const form = new URLSearchParams();
-  form.append("text", teksLengkap);
-  form.append("prompt", teksLengkap);
-  form.append("question", teksLengkap);
-  const body = form.toString();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const r = await undiciFetch(UPSTREAM_BASE, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-        "Accept": "application/json",
+        "User-Agent": BROWSER_UA,
         "Content-Length": String(Buffer.byteLength(body, "utf8")),
       },
       body,
@@ -144,23 +110,22 @@ async function callUpstreamForm(teksLengkap) {
   }
 }
 
-async function callUpstreamGetQuestionOnly(question) {
-  // Prompt TIDAK ikut di URL. Hanya pertanyaan user, dipotong di 1200 char
-  // (aman untuk limit URL 4KB setelah encoding + base URL).
-  const safeQ = question.length > MAX_QUESTION_CHARS ? question.slice(0, MAX_QUESTION_CHARS) : question;
-  const params = new URLSearchParams({ text: safeQ });
-  const target = UPSTREAM_BASE + "?" + params.toString();
+async function callUpstreamForm(payload) {
+  const form = new URLSearchParams();
+  for (const [k, v] of Object.entries(payload)) form.append(k, String(v));
+  const body = form.toString();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const r = await undiciFetch(target, {
-      method: "GET",
+    const r = await undiciFetch(UPSTREAM_BASE, {
+      method: "POST",
       headers: {
-        Accept: "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; VercelProxy/1.0)",
-        "X-Prompt-Mode": "question-only",
-        "X-Prompt-Chars": String(PROMPT_TERTANAM.length),
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        "Accept": "application/json",
+        "User-Agent": BROWSER_UA,
+        "Content-Length": String(Buffer.byteLength(body, "utf8")),
       },
+      body,
       dispatcher: http1Agent,
       signal: controller.signal,
     });
@@ -171,11 +136,12 @@ async function callUpstreamGetQuestionOnly(question) {
   }
 }
 
-async function callUpstream(teksLengkap, question) {
+async function callUpstream(teksLengkap) {
+  // Payload selalu punya isi. POST tanpa body = 403 di upstream.
+  const payload = { text: teksLengkap, prompt: teksLengkap, question: teksLengkap };
   const attempts = [
-    { name: "POST JSON",           fn: () => callUpstreamJson(teksLengkap) },
-    { name: "POST URL-encoded",    fn: () => callUpstreamForm(teksLengkap) },
-    { name: "GET question-only",   fn: () => callUpstreamGetQuestionOnly(question) },
+    { name: "POST JSON + UA browser",        fn: () => callUpstreamJson(payload) },
+    { name: "POST URL-encoded + UA browser", fn: () => callUpstreamForm(payload) },
   ];
   let last = null;
   for (const a of attempts) {
@@ -187,7 +153,7 @@ async function callUpstream(teksLengkap, question) {
     if (out.ok && out.parsed && (out.parsed.status === true || out.parsed.status === "true")) {
       return { ...out, attempt: a.name };
     }
-    last = { attempt: a.name, httpStatus: out.httpStatus, body: out.parsed ?? out.raw?.slice(0, 2048) };
+    last = { attempt: a.name, httpStatus: out.httpStatus, body_preview: out.raw?.slice(0, 512) };
   }
   return { ok: false, last };
 }
@@ -225,17 +191,17 @@ export default async function handler(req, res) {
 
   const question = extractQuestion(body, url);
   if (!question) return json(res, 400, { ok: false, error: "Pertanyaan kosong" });
-  if (question.length > 4000) return json(res, 400, { ok: false, error: "Pertanyaan maks 4000 karakter" });
+  if (question.length > MAX_QUESTION_CHARS) return json(res, 400, { ok: false, error: `Pertanyaan maks ${MAX_QUESTION_CHARS} karakter` });
 
   const teksLengkap = PROMPT_TERTANAM + "\nPertanyaan user: " + question;
 
   try {
-    const upstream = await callUpstream(teksLengkap, question);
+    const upstream = await callUpstream(teksLengkap);
 
     if (!upstream.ok) {
       return json(res, 502, {
         ok: false,
-        error: "Upstream gagal di semua varian",
+        error: "Upstream gagal di semua varian POST",
         last_attempt: upstream.last,
         prompt_chars: PROMPT_TERTANAM.length,
         full_payload_chars: teksLengkap.length,
@@ -250,7 +216,6 @@ export default async function handler(req, res) {
         attempt: upstream.attempt,
         upstream_status: upstream.httpStatus,
         upstream_keys: upstream.parsed && typeof upstream.parsed === "object" ? Object.keys(upstream.parsed) : null,
-        upstream_raw: upstream.parsed ?? upstream.raw?.slice(0, 2048),
       });
     }
 
